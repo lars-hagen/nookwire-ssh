@@ -14,7 +14,7 @@ The local machine which generates and uses commands needs Python 3, gzip, base64
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-The installer places `nookwire-ssh` and its Python server companion in `~/.local/bin`. Add that directory to `PATH` if needed. It installs the version-pinned `v1.0.0` files and restores the previous pair if replacement fails.
+The installer places `nookwire-ssh` and its Python server companion in `~/.local/bin`. Add that directory to `PATH` if needed. It installs the version-pinned `v1.0.1` files and restores the previous pair if replacement fails.
 
 ## Remote setup
 
@@ -32,7 +32,7 @@ Generate the srv.us tunnel block:
 nookwire-ssh tunnel 8022 1
 ```
 
-Paste it into remote terminal 2. It creates `~/.ssh/id_ed25519` when needed, suppresses srv.us host-key prompts, and forwards slot `1` to AsyncSSH. Reusing the same SSH key and slot gives srv.us a stable hostname.
+Paste it into remote terminal 2. Before starting srv.us, it prints ready-to-copy SSH, SFTP, and SCP templates. It then creates `~/.ssh/id_ed25519` when needed, suppresses srv.us host-key prompts, and forwards slot `1` to AsyncSSH. Reusing the same SSH key and slot gives srv.us a stable hostname.
 
 srv.us prints a URL resembling:
 
@@ -42,26 +42,20 @@ https://example.srv.us/
 
 ## Connect through TLS
 
-srv.us wraps non-HTTP traffic in TLS. Generate ready-to-copy OpenSSL ProxyCommand examples:
-
-```sh
-nookwire-ssh connect example.srv.us
-```
-
-This prints SSH, SFTP, and SCP commands. The underlying forms are:
+srv.us wraps non-HTTP traffic in TLS. The tunnel block prints these templates before starting srv.us. Replace `HOSTNAME.srv.us` with the hostname in the URL srv.us prints:
 
 ```sh
 ssh -T -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  nookwire@example.srv.us
+  nookwire@HOSTNAME.srv.us
 
 sftp -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  nookwire@example.srv.us
+  nookwire@HOSTNAME.srv.us
 
 scp -O -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  notebook.py nookwire@example.srv.us:/notebook.py
+  notebook.py nookwire@HOSTNAME.srv.us:/notebook.py
 ```
 
 Enter the generated Nookwire password when prompted. `scp -O` selects the SCP protocol implemented by AsyncSSH.

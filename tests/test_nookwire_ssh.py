@@ -183,7 +183,7 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mode 0700"):
                 ensure_host_key(parent / "host-key")
 
-    def test_bootstrap_tunnel_and_connect_output(self):
+    def test_bootstrap_and_tunnel_output(self):
         bootstrap = subprocess.run(
             [str(LAUNCHER), "bootstrap", "/tmp/a path", "8022"],
             check=True, capture_output=True, text=True,
@@ -192,27 +192,17 @@ class LauncherTests(unittest.TestCase):
             [str(LAUNCHER), "tunnel", "8022", "1"],
             check=True, capture_output=True, text=True,
         ).stdout
-        connect = subprocess.run(
-            [str(LAUNCHER), "connect", "https://example.srv.us/"],
-            check=True, capture_output=True, text=True,
-        ).stdout
         self.assertIn("asyncssh==2.24.0", bootstrap)
         self.assertIn("--root '/tmp/a path'", bootstrap)
         self.assertIn("ssh-keygen", tunnel)
         self.assertIn("srv.us -R 1:127.0.0.1:8022", tunnel)
         self.assertIn("StrictHostKeyChecking=no", tunnel)
-        self.assertIn("ProxyCommand=openssl s_client", connect)
-        self.assertIn("-verify_return_error -verify_hostname %h", connect)
-        self.assertIn("nookwire@example.srv.us", connect)
-        self.assertIn("scp -O", connect)
+        self.assertIn("ProxyCommand=openssl s_client", tunnel)
+        self.assertIn("-verify_return_error -verify_hostname %h", tunnel)
+        self.assertIn("nookwire@HOSTNAME.srv.us", tunnel)
+        self.assertIn("scp -O", tunnel)
         subprocess.run(["sh", "-n"], input=bootstrap, text=True, check=True)
         subprocess.run(["sh", "-n"], input=tunnel, text=True, check=True)
-        subprocess.run(["sh", "-n"], input=connect, text=True, check=True)
-        for bad_host in ("$(id).srv.us", "bad name.srv.us", "example.com"):
-            rejected = subprocess.run(
-                [str(LAUNCHER), "connect", bad_host], capture_output=True, text=True,
-            )
-            self.assertNotEqual(rejected.returncode, 0)
 
     def test_bootstrap_executes_with_quoted_root_and_password(self):
         with tempfile.TemporaryDirectory() as temp:
