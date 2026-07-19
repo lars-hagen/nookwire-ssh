@@ -1,0 +1,319 @@
+import asyncio
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+import asyncssh
+
+from nookwire_ssh import Config, create_acceptor, ensure_host_key
+
+
+PROJECT = Path(__file__).resolve().parents[1]
+LAUNCHER = PROJECT / "nookwire-ssh"
+
+
+class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name) / "root"
+        self.root.mkdir()
+        self.password = "test-password-long-enough"
+        self.config = Config(
+            root=self.root,
+            host="127.0.0.1",
+            port=0,
+            username="nookwire",
+            password=self.password,
+            password_env="NOOKWIRE_SSH_PASSWORD",
+            host_key=Path(self.temporary.name) / "host_key",
+            shell="/bin/sh",
+        )
+        self.acceptor = await create_acceptor(self.config)
+        self.port = self.acceptor.get_port()
+
+    async def asyncTearDown(self):
+        self.acceptor.close()
+        await self.acceptor.wait_closed()
+        self.temporary.cleanup()
+
+    async def connect(self, password=None):
+        return await asyncssh.connect(
+            "127.0.0.1",
+            port=self.port,
+            username="nookwire",
+            password=password or self.password,
+            known_hosts=None,
+        )
+
+    async def test_password_auth_and_command_execution(self):
+        async with await self.connect() as connection:
+            result = await connection.run("pwd; printf 'ok\\n'; printf '%s' \"$NOOKWIRE_SSH_PASSWORD\"", check=True)
+        self.assertEqual(result.stdout, f"{self.root}\nok\n")
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await self.connect("incorrect-password-long")
+
+    async def test_sftp_is_root_mapped(self):
+        (self.root / "source.txt").write_text("hello", encoding="utf-8")
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("secret", encoding="utf-8")
+        (self.root / "outside-link").symlink_to(outside, target_is_directory=True)
+        inside = self.root / "inside"
+        inside.mkdir()
+        (self.root / "inside-link").symlink_to(inside, target_is_directory=True)
+        async with await self.connect() as connection:
+            async with connection.start_sftp_client() as sftp:
+                self.assertEqual(await sftp.getcwd(), "/")
+                async with sftp.open("/source.txt", "rb") as source:
+                    self.assertEqual(await source.read(), b"hello")
+                await sftp.put(str(self.root / "source.txt"), "/nested.txt")
+                async with sftp.open("/nested.txt", "rb") as nested:
+                    data = await nested.read()
+                with self.assertRaises(asyncssh.SFTPPermissionDenied):
+                    await sftp.open("/outside-link/secret.txt", "rb")
+                attrs = await sftp.lstat("/outside-link")
+                self.assertIsNotNone(attrs.permissions)
+                with self.assertRaises(asyncssh.SFTPPermissionDenied):
+                    await sftp.readlink("/outside-link")
+                await sftp.rename("/outside-link", "/renamed-link")
+                with self.assertRaises(asyncssh.SFTPPermissionDenied):
+                    await sftp.open("/renamed-link/secret.txt", "rb")
+                await sftp.remove("/renamed-link")
+                with self.assertRaises(asyncssh.SFTPError):
+                    await sftp.rmdir("/inside-link")
+                await sftp.remove("/inside-link")
+        self.assertEqual(data, b"hello")
+        self.assertEqual((self.root / "nested.txt").read_text(encoding="utf-8"), "hello")
+        self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "secret")
+        self.assertFalse((self.root / "renamed-link").exists())
+        self.assertTrue(inside.is_dir())
+
+    async def test_asyncssh_scp_round_trip(self):
+        local = Path(self.temporary.name) / "local.txt"
+        local.write_text("through scp", encoding="utf-8")
+        downloaded = Path(self.temporary.name) / "downloaded.txt"
+        async with await self.connect() as connection:
+            await asyncssh.scp(local, (connection, "/remote.txt"))
+            await asyncssh.scp((connection, "/remote.txt"), downloaded)
+        self.assertEqual(downloaded.read_text(encoding="utf-8"), "through scp")
+
+    async def test_disconnect_terminates_running_command(self):
+        connection = await self.connect()
+        process = await connection.create_process("sh -c 'echo $$; exec sleep 60'")
+        pid = int((await process.stdout.readline()).strip())
+        connection.close()
+        await connection.wait_closed()
+
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.02)
+        else:
+            self.fail(f"child process {pid} survived SSH disconnect")
+
+    async def test_system_ssh_and_scp_clients(self):
+        if not shutil.which("ssh") or not shutil.which("scp"):
+            self.skipTest("OpenSSH clients are unavailable")
+
+        askpass = Path(self.temporary.name) / "askpass.sh"
+        askpass.write_text("#!/bin/sh\nprintf '%s\\n' \"$NOOKWIRE_TEST_PASSWORD\"\n", encoding="utf-8")
+        askpass.chmod(0o700)
+        environment = {
+            **os.environ,
+            "DISPLAY": "nookwire:0",
+            "SSH_ASKPASS": str(askpass),
+            "SSH_ASKPASS_REQUIRE": "force",
+            "NOOKWIRE_TEST_PASSWORD": self.password,
+        }
+        options = [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            "-p", str(self.port),
+        ]
+
+        ssh = await asyncio.create_subprocess_exec(
+            "ssh", *options, "nookwire@127.0.0.1", "printf system-ssh",
+            env=environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await ssh.communicate()
+        self.assertEqual(ssh.returncode, 0, stderr.decode())
+        self.assertEqual(stdout, b"system-ssh")
+
+        source = Path(self.temporary.name) / "system-source.txt"
+        source.write_text("system scp", encoding="utf-8")
+        scp_options = [
+            "-O",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "PreferredAuthentications=password",
+            "-o", "PubkeyAuthentication=no",
+            "-P", str(self.port),
+        ]
+        scp = await asyncio.create_subprocess_exec(
+            "scp", *scp_options, str(source), "nookwire@127.0.0.1:/system-scp.txt",
+            env=environment, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await scp.communicate()
+        self.assertEqual(scp.returncode, 0, stderr.decode())
+        self.assertEqual((self.root / "system-scp.txt").read_text(encoding="utf-8"), "system scp")
+
+
+class LauncherTests(unittest.TestCase):
+    def test_existing_host_key_requires_private_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            key = Path(temp) / "host-key"
+            key.write_text("not a key", encoding="utf-8")
+            key.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "mode 0600"):
+                ensure_host_key(key)
+
+    def test_host_key_parent_requires_private_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "shared"
+            parent.mkdir(mode=0o755)
+            parent.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "mode 0700"):
+                ensure_host_key(parent / "host-key")
+
+    def test_bootstrap_tunnel_and_connect_output(self):
+        bootstrap = subprocess.run(
+            [str(LAUNCHER), "bootstrap", "/tmp/a path", "8022"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        tunnel = subprocess.run(
+            [str(LAUNCHER), "tunnel", "8022", "1"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        connect = subprocess.run(
+            [str(LAUNCHER), "connect", "https://example.srv.us/"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        self.assertIn("asyncssh==2.24.0", bootstrap)
+        self.assertIn("--root '/tmp/a path'", bootstrap)
+        self.assertIn("ssh-keygen", tunnel)
+        self.assertIn("srv.us -R 1:127.0.0.1:8022", tunnel)
+        self.assertIn("StrictHostKeyChecking=no", tunnel)
+        self.assertIn("ProxyCommand=openssl s_client", connect)
+        self.assertIn("-verify_return_error -verify_hostname %h", connect)
+        self.assertIn("nookwire@example.srv.us", connect)
+        self.assertIn("scp -O", connect)
+        subprocess.run(["sh", "-n"], input=bootstrap, text=True, check=True)
+        subprocess.run(["sh", "-n"], input=tunnel, text=True, check=True)
+        subprocess.run(["sh", "-n"], input=connect, text=True, check=True)
+        for bad_host in ("$(id).srv.us", "bad name.srv.us", "example.com"):
+            rejected = subprocess.run(
+                [str(LAUNCHER), "connect", bad_host], capture_output=True, text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+    def test_bootstrap_executes_with_quoted_root_and_password(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            root = temp_path / "root with spaces"
+            root.mkdir()
+            bin_dir = temp_path / "bin"
+            bin_dir.mkdir()
+            args_path = temp_path / "uv-args"
+            password_path = temp_path / "password"
+            fake_uv = bin_dir / "uv"
+            fake_uv.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" > '{args_path}'\n"
+                f"printf '%s' \"$NOOKWIRE_SSH_PASSWORD\" > '{password_path}'\n",
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+            bootstrap = subprocess.run(
+                [str(LAUNCHER), "bootstrap", str(root), "8022"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            environment = os.environ.copy()
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["TMPDIR"] = str(temp_path)
+            subprocess.run(
+                ["sh"], input=bootstrap, text=True, check=True, env=environment,
+                capture_output=True,
+            )
+            args = args_path.read_text(encoding="utf-8")
+            password = password_path.read_text(encoding="utf-8")
+            self.assertIn(str(root), args)
+            self.assertIn("8022", args)
+            self.assertGreaterEqual(len(password), 32)
+            self.assertFalse(any(temp_path.glob("nookwire-ssh.*")))
+
+    def test_curl_installer_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            prefix = Path(temp) / "prefix"
+            environment = {
+                **os.environ,
+                "NOOKWIRE_SSH_PREFIX": str(prefix),
+                "NOOKWIRE_SSH_BASE_URL": PROJECT.as_uri(),
+            }
+            subprocess.run(
+                ["sh", str(PROJECT / "install.sh")],
+                check=True, capture_output=True, text=True, env=environment,
+            )
+            installed = prefix / "bin" / "nookwire-ssh"
+            companion = prefix / "bin" / "nookwire_ssh.py"
+            self.assertTrue(os.access(installed, os.X_OK))
+            self.assertTrue(companion.is_file())
+            subprocess.run([str(installed), "--help"], check=True, capture_output=True)
+
+    def test_installer_rejects_unsafe_destination_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            prefix = temp_path / "prefix"
+            bin_dir = prefix / "bin"
+            bin_dir.mkdir(parents=True)
+            launcher = bin_dir / "nookwire-ssh"
+            server = bin_dir / "nookwire_ssh.py"
+            launcher.write_text("old launcher", encoding="utf-8")
+            server.write_text("old server", encoding="utf-8")
+
+            unsafe = temp_path / "unsafe-prefix" / "bin"
+            unsafe.mkdir(parents=True)
+            (unsafe / "nookwire-ssh").mkdir()
+            base_environment = {
+                **os.environ,
+                "NOOKWIRE_SSH_BASE_URL": PROJECT.as_uri(),
+            }
+            rejected = subprocess.run(
+                ["sh", str(PROJECT / "install.sh")], capture_output=True, text=True,
+                env={**base_environment, "NOOKWIRE_SSH_PREFIX": str(unsafe.parent)},
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+
+            fake_bin = temp_path / "fake-bin"
+            fake_bin.mkdir()
+            real_mv = shutil.which("mv")
+            self.assertIsNotNone(real_mv)
+            (fake_bin / "mv").write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in *backup*) ;; *nookwire_ssh.py) exit 1 ;; esac\n"
+                f"exec '{real_mv}' \"$@\"\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "mv").chmod(0o755)
+            failed = subprocess.run(
+                ["sh", str(PROJECT / "install.sh")], capture_output=True, text=True,
+                env={
+                    **base_environment,
+                    "NOOKWIRE_SSH_PREFIX": str(prefix),
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                },
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(launcher.read_text(encoding="utf-8"), "old launcher")
+            self.assertEqual(server.read_text(encoding="utf-8"), "old server")
+
+
+if __name__ == "__main__":
+    unittest.main()

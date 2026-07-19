@@ -1,0 +1,121 @@
+#!/bin/sh
+set -eu
+
+ASYNCSSH_VERSION=${NOOKWIRE_ASYNCSSH_VERSION:-2.24.0}
+
+usage() {
+  cat <<'EOF'
+Usage: nookwire-ssh COMMAND [ARGS]
+
+  bootstrap [REMOTE_ROOT] [PORT]
+  tunnel [PORT] [SLOT]
+  connect SRV_HOST [USERNAME]
+
+bootstrap prints a paste-ready command which starts the AsyncSSH server.
+tunnel prints the srv.us forwarding command for a second terminal.
+connect prints TLS-wrapped SSH, SFTP, and SCP command examples.
+EOF
+}
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+shell_quote() {
+  python3 -c 'import shlex,sys; print(shlex.quote(sys.argv[1]))' "$1"
+}
+
+validate_port() {
+  python3 -c 'import re,sys; s=sys.argv[1]; valid=bool(re.fullmatch(r"[0-9]+", s)); valid or sys.exit(1); p=int(s); 1 <= p <= 65535 or sys.exit(1); print(p)' "$1"
+}
+
+validate_slot() {
+  python3 -c 'import re,sys; s=sys.argv[1]; valid=bool(re.fullmatch(r"[0-9]+", s)); valid or sys.exit(1); n=int(s); n >= 1 or sys.exit(1); print(n)' "$1"
+}
+
+normalize_host() {
+  python3 -c 'import re,sys,urllib.parse; value=sys.argv[1].strip(); parsed=urllib.parse.urlparse(value if "://" in value else "//"+value); host=(parsed.hostname or "").lower().rstrip("."); labels=host.split("."); valid=host.endswith(".srv.us") and len(host) <= 253 and all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels); valid or sys.exit(1); print(host)' "$1"
+}
+
+command=${1:-help}
+[ $# -eq 0 ] || shift
+
+case "$command" in
+  bootstrap)
+    [ $# -le 2 ] || die "Usage: nookwire-ssh bootstrap [REMOTE_ROOT] [PORT]"
+    root=${1:-/marimo}
+    port=$(validate_port "${2:-8022}") || die "PORT must contain only ASCII digits and be from 1 to 65535"
+    here=$(CDPATH= cd "$(dirname "$0")" && pwd)
+    payload=$(gzip -c "$here/nookwire_ssh.py" | base64 | tr -d '\n')
+    root_quoted=$(shell_quote "$root")
+    version_quoted=$(shell_quote "asyncssh==$ASYNCSSH_VERSION")
+    cat <<EOF
+set -eu
+nookwire_tmp="\$(mktemp -d "\${TMPDIR:-/tmp}/nookwire-ssh.XXXXXX")"
+chmod 700 "\$nookwire_tmp"
+trap 'rm -rf "\$nookwire_tmp"' 0 HUP INT TERM
+nookwire_script="\$nookwire_tmp/nookwire_ssh.py"
+python3 -c 'import base64,gzip,pathlib,sys;pathlib.Path(sys.argv[1]).write_bytes(gzip.decompress(base64.b64decode(sys.argv[2])))' "\$nookwire_script" "$payload"
+export NOOKWIRE_SSH_PASSWORD="\$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+printf 'Username: nookwire\nPassword: %s\n' "\$NOOKWIRE_SSH_PASSWORD"
+uv run --with $version_quoted python "\$nookwire_script" --root $root_quoted --host 127.0.0.1 --port $port
+EOF
+    ;;
+  tunnel)
+    [ $# -le 2 ] || die "Usage: nookwire-ssh tunnel [PORT] [SLOT]"
+    port=$(validate_port "${1:-8022}") || die "PORT must contain only ASCII digits and be from 1 to 65535"
+    slot=$(validate_slot "${2:-1}") || die "SLOT must be a positive integer"
+    cat <<EOF
+set -eu
+umask 077
+mkdir -p "\$HOME/.ssh"
+chmod 700 "\$HOME/.ssh"
+if [ ! -s "\$HOME/.ssh/id_ed25519" ]; then
+  ssh-keygen -q -t ed25519 -N '' -f "\$HOME/.ssh/id_ed25519"
+fi
+printf '%s\n' 'When srv.us prints the HTTPS URL, copy its hostname and run:'
+printf '%s\n' '  nookwire-ssh connect HOSTNAME.srv.us'
+ssh \
+  -i "\$HOME/.ssh/id_ed25519" \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  srv.us -R $slot:127.0.0.1:$port
+EOF
+    ;;
+  connect)
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "Usage: nookwire-ssh connect SRV_HOST [USERNAME]"
+    host=$(normalize_host "$1") || die "SRV_HOST must be a valid srv.us hostname or URL"
+    username=${2:-nookwire}
+    case "$username" in *[!A-Za-z0-9_.-]*|'') die "USERNAME contains unsupported characters" ;; esac
+    destination=$(shell_quote "$username@$host")
+    cat <<EOF
+ssh -T \\
+  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  $destination
+
+sftp \\
+  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  $destination
+
+scp -O \\
+  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  LOCAL_FILE $destination:/REMOTE_PATH
+EOF
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
