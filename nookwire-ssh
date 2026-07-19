@@ -112,7 +112,14 @@ show_status() {
   host=$(extract_host 2>/dev/null || true)
   if [ -n "$host" ]; then
     printf 'url: https://%s/\n' "$host"
-    printf 'ssh host: %s\n' "$host"
+    cat <<EOF
+ssh:
+ssh -T \\
+  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
+  -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null \\
+  nookwire@$host
+EOF
   else
     printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
   fi
@@ -197,7 +204,6 @@ case "$command" in
     fi
     printf 'Nookwire SSH started in the background.\n'
     show_status || true
-    printf 'logs: %s\n' "$STATE_DIR"
     ;;
   status)
     [ $# -eq 0 ] || die "Usage: nookwire-ssh status"

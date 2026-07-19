@@ -14,7 +14,7 @@ The remote machine needs Python 3, uv, OpenSSH, and `ssh-keygen`. A connecting m
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-Run the installer on the remote machine you want to expose. It places `nookwire-ssh` and its Python server companion in `~/.local/bin`. Add that directory to `PATH` if needed. It installs the version-pinned `v1.0.2` files and restores the previous pair if replacement fails.
+Run the installer on the remote machine you want to expose. It places `nookwire-ssh` and its Python server companion in `~/.local/bin`. Add that directory to `PATH` if needed. It installs the version-pinned `v1.0.3` files and restores the previous pair if replacement fails.
 
 ## Start
 
@@ -24,7 +24,7 @@ Start AsyncSSH and the srv.us tunnel together in the background:
 nookwire-ssh start /marimo 8022 1
 ```
 
-The command prints the generated password and srv.us URL when available. It returns to the shell while both services keep running.
+The command prints the generated password, srv.us URL, and a ready-to-run TLS-wrapped SSH command. It returns to the shell while both services keep running. `status` prints the same connection details later.
 
 Inspect them later:
 
@@ -44,7 +44,7 @@ The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gi
 
 ## Connect through TLS
 
-srv.us wraps non-HTTP traffic in TLS. Replace `HOSTNAME.srv.us` with the hostname shown by `nookwire-ssh status`:
+srv.us wraps non-HTTP traffic in TLS. `start` and `status` print the SSH form below with the actual hostname filled in. Replace `HOSTNAME.srv.us` manually for SFTP or SCP:
 
 ```sh
 ssh -T -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \

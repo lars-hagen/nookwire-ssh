@@ -237,6 +237,9 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn("server: running", status)
                 self.assertIn("tunnel: running", status)
                 self.assertIn("url: https://example.srv.us/", status)
+                self.assertIn("ProxyCommand=openssl s_client", status)
+                self.assertIn("nookwire@example.srv.us", status)
+                self.assertNotIn("logs:", started)
                 self.assertGreaterEqual(
                     len((temp_path / "state with spaces" / "password").read_text()), 32
                 )
