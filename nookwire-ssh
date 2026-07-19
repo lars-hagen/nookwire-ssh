@@ -2,24 +2,30 @@
 set -eu
 
 ASYNCSSH_VERSION=${NOOKWIRE_ASYNCSSH_VERSION:-2.24.0}
+STATE_DIR=${NOOKWIRE_SSH_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/nookwire-ssh}
+SERVER_PID_FILE=$STATE_DIR/server.pid
+TUNNEL_PID_FILE=$STATE_DIR/tunnel.pid
+SERVER_LOG=$STATE_DIR/server.log
+TUNNEL_LOG=$STATE_DIR/tunnel.log
+PASSWORD_FILE=$STATE_DIR/password
 
 usage() {
   cat <<'EOF'
 Usage: nookwire-ssh COMMAND [ARGS]
 
-  bootstrap [REMOTE_ROOT] [PORT]
-  tunnel [PORT] [SLOT]
+  start [REMOTE_ROOT] [PORT] [SLOT]
+  status
+  logs [all|server|tunnel] [-f]
+  stop
 
-bootstrap prints a paste-ready command which starts the AsyncSSH server.
-tunnel prints client command templates, then the srv.us forwarding command.
+start launches AsyncSSH and srv.us in the background.
+status prints processes, credentials, and the srv.us URL when available.
+logs shows the last 100 log lines; add -f to follow.
+stop terminates both background processes.
 EOF
 }
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
-
-shell_quote() {
-  python3 -c 'import shlex,sys; print(shlex.quote(sys.argv[1]))' "$1"
-}
 
 validate_port() {
   python3 -c 'import re,sys; s=sys.argv[1]; valid=bool(re.fullmatch(r"[0-9]+", s)); valid or sys.exit(1); p=int(s); 1 <= p <= 65535 or sys.exit(1); print(p)' "$1"
@@ -29,71 +35,199 @@ validate_slot() {
   python3 -c 'import re,sys; s=sys.argv[1]; valid=bool(re.fullmatch(r"[0-9]+", s)); valid or sys.exit(1); n=int(s); n >= 1 or sys.exit(1); print(n)' "$1"
 }
 
+setup_state() {
+  umask 077
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+}
+
+read_pid() {
+  [ -f "$1" ] || return 1
+  set -- $(cat "$1")
+  [ "$#" -eq 2 ] || return 1
+  pid=$1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$pid"
+}
+
+process_identity() {
+  python3 -c 'import hashlib,os,pathlib,subprocess,sys; p=sys.argv[1]; f=pathlib.Path("/proc")/p/"stat"; data=f.read_text().rsplit(")",1)[1].split()[19] if f.is_file() else subprocess.check_output(["ps","-p",p,"-o","lstart="], text=True).strip(); data or sys.exit(1); print(hashlib.sha256(data.encode()).hexdigest())' "$1" 2>/dev/null
+}
+
+is_running() {
+  pid=$(read_pid "$1") || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  set -- $(cat "$1")
+  identity=$(process_identity "$pid") || return 1
+  [ "$identity" = "$2" ]
+}
+
+write_pid() {
+  pid=$1
+  file=$2
+  identity=$(process_identity "$pid") || return 1
+  printf '%s %s\n' "$pid" "$identity" > "$file"
+}
+
+port_open() {
+  python3 -c 'import socket,sys; s=socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2); s.close()' "$1" 2>/dev/null
+}
+
+stop_one() {
+  file=$1
+  pid=$(read_pid "$file") || { rm -f "$file"; return; }
+  if is_running "$file"; then
+    kill "$pid" 2>/dev/null || true
+    count=0
+    while is_running "$file" && [ "$count" -lt 50 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if is_running "$file"; then kill -9 "$pid" 2>/dev/null || true; fi
+  fi
+  rm -f "$file"
+}
+
+extract_host() {
+  [ -f "$TUNNEL_LOG" ] || return 1
+  python3 -c 'import pathlib,re,sys; m=re.findall(r"https://([A-Za-z0-9.-]+\.srv\.us)/?", pathlib.Path(sys.argv[1]).read_text(errors="replace")); print(m[-1] if m else "")' "$TUNNEL_LOG"
+}
+
+show_status() {
+  if is_running "$SERVER_PID_FILE"; then
+    printf 'server: running (pid %s)\n' "$(read_pid "$SERVER_PID_FILE")"
+    server_ok=1
+  else
+    printf 'server: stopped\n'
+    server_ok=0
+  fi
+  if is_running "$TUNNEL_PID_FILE"; then
+    printf 'tunnel: running (pid %s)\n' "$(read_pid "$TUNNEL_PID_FILE")"
+    tunnel_ok=1
+  else
+    printf 'tunnel: stopped\n'
+    tunnel_ok=0
+  fi
+  [ ! -f "$PASSWORD_FILE" ] || printf 'username: nookwire\npassword: %s\n' "$(cat "$PASSWORD_FILE")"
+  host=$(extract_host 2>/dev/null || true)
+  if [ -n "$host" ]; then
+    printf 'url: https://%s/\n' "$host"
+    printf 'ssh host: %s\n' "$host"
+  else
+    printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
+  fi
+  [ "$server_ok" -eq 1 ] && [ "$tunnel_ok" -eq 1 ]
+}
+
 command=${1:-help}
 [ $# -eq 0 ] || shift
 
 case "$command" in
-  bootstrap)
-    [ $# -le 2 ] || die "Usage: nookwire-ssh bootstrap [REMOTE_ROOT] [PORT]"
+  start)
+    [ $# -le 3 ] || die "Usage: nookwire-ssh start [REMOTE_ROOT] [PORT] [SLOT]"
     root=${1:-/marimo}
     port=$(validate_port "${2:-8022}") || die "PORT must contain only ASCII digits and be from 1 to 65535"
+    slot=$(validate_slot "${3:-1}") || die "SLOT must be a positive integer"
+    [ -d "$root" ] || die "REMOTE_ROOT is not a directory: $root"
+    command -v uv >/dev/null 2>&1 || die "uv is required"
+    command -v ssh >/dev/null 2>&1 || die "ssh is required"
+    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
     here=$(CDPATH= cd "$(dirname "$0")" && pwd)
-    payload=$(gzip -c "$here/nookwire_ssh.py" | base64 | tr -d '\n')
-    root_quoted=$(shell_quote "$root")
-    version_quoted=$(shell_quote "asyncssh==$ASYNCSSH_VERSION")
-    cat <<EOF
-set -eu
-nookwire_tmp="\$(mktemp -d "\${TMPDIR:-/tmp}/nookwire-ssh.XXXXXX")"
-chmod 700 "\$nookwire_tmp"
-trap 'rm -rf "\$nookwire_tmp"' 0 HUP INT TERM
-nookwire_script="\$nookwire_tmp/nookwire_ssh.py"
-python3 -c 'import base64,gzip,pathlib,sys;pathlib.Path(sys.argv[1]).write_bytes(gzip.decompress(base64.b64decode(sys.argv[2])))' "\$nookwire_script" "$payload"
-export NOOKWIRE_SSH_PASSWORD="\$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
-printf 'Username: nookwire\nPassword: %s\n' "\$NOOKWIRE_SSH_PASSWORD"
-uv run --with $version_quoted python "\$nookwire_script" --root $root_quoted --host 127.0.0.1 --port $port
-EOF
+    server_script=$here/nookwire_ssh.py
+    [ -f "$server_script" ] || die "Missing server companion: $server_script"
+    setup_state
+    ! is_running "$SERVER_PID_FILE" || die "Server is already running"
+    ! is_running "$TUNNEL_PID_FILE" || die "Tunnel is already running"
+    rm -f "$SERVER_PID_FILE" "$TUNNEL_PID_FILE"
+    ! port_open "$port" || die "Port $port is already in use"
+    password=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
+    printf '%s' "$password" > "$PASSWORD_FILE"
+    : > "$SERVER_LOG"
+    : > "$TUNNEL_LOG"
+    NOOKWIRE_SSH_PASSWORD=$password nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
+      python "$server_script" --root "$root" --host 127.0.0.1 --port "$port" \
+      >"$SERVER_LOG" 2>&1 </dev/null &
+    server_pid=$!
+    write_pid "$server_pid" "$SERVER_PID_FILE" || die "Unable to track server process"
+    ready=0
+    count=0
+    while [ "$count" -lt 120 ]; do
+      if ! is_running "$SERVER_PID_FILE"; then break; fi
+      if port_open "$port"; then
+        ready=1
+        break
+      fi
+      sleep 0.5
+      count=$((count + 1))
+    done
+    if [ "$ready" -ne 1 ]; then
+      stop_one "$SERVER_PID_FILE"
+      printf 'Server failed to start. Log:\n' >&2
+      tail -n 100 "$SERVER_LOG" >&2 || true
+      exit 1
+    fi
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
+      ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+    fi
+    nohup ssh \
+      -i "$HOME/.ssh/id_ed25519" \
+      -o IdentitiesOnly=yes \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      -o ExitOnForwardFailure=yes \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=3 \
+      srv.us -R "$slot:127.0.0.1:$port" \
+      >"$TUNNEL_LOG" 2>&1 </dev/null &
+    tunnel_pid=$!
+    write_pid "$tunnel_pid" "$TUNNEL_PID_FILE" || {
+      stop_one "$SERVER_PID_FILE"
+      die "Unable to track tunnel process"
+    }
+    sleep 2
+    if ! is_running "$TUNNEL_PID_FILE"; then
+      stop_one "$SERVER_PID_FILE"
+      rm -f "$TUNNEL_PID_FILE"
+      printf 'Tunnel failed to start. Log:\n' >&2
+      tail -n 100 "$TUNNEL_LOG" >&2 || true
+      exit 1
+    fi
+    printf 'Nookwire SSH started in the background.\n'
+    show_status || true
+    printf 'logs: %s\n' "$STATE_DIR"
     ;;
-  tunnel)
-    [ $# -le 2 ] || die "Usage: nookwire-ssh tunnel [PORT] [SLOT]"
-    port=$(validate_port "${1:-8022}") || die "PORT must contain only ASCII digits and be from 1 to 65535"
-    slot=$(validate_slot "${2:-1}") || die "SLOT must be a positive integer"
-    cat <<EOF
-set -eu
-umask 077
-mkdir -p "\$HOME/.ssh"
-chmod 700 "\$HOME/.ssh"
-if [ ! -s "\$HOME/.ssh/id_ed25519" ]; then
-  ssh-keygen -q -t ed25519 -N '' -f "\$HOME/.ssh/id_ed25519"
-fi
-cat <<'NOOKWIRE_CLIENT'
-When srv.us prints its HTTPS URL, replace HOSTNAME.srv.us below with that hostname:
-
-ssh -T \
-  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  nookwire@HOSTNAME.srv.us
-
-sftp \
-  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  nookwire@HOSTNAME.srv.us
-
-scp -O \
-  -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  LOCAL_FILE nookwire@HOSTNAME.srv.us:/REMOTE_PATH
-NOOKWIRE_CLIENT
-ssh \
-  -i "\$HOME/.ssh/id_ed25519" \
-  -o IdentitiesOnly=yes \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null \
-  -o LogLevel=ERROR \
-  -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=30 \
-  -o ServerAliveCountMax=3 \
-  srv.us -R $slot:127.0.0.1:$port
-EOF
+  status)
+    [ $# -eq 0 ] || die "Usage: nookwire-ssh status"
+    setup_state
+    show_status
+    ;;
+  logs)
+    [ $# -le 2 ] || die "Usage: nookwire-ssh logs [all|server|tunnel] [-f]"
+    target=${1:-all}
+    follow=${2:-}
+    [ -z "$follow" ] || [ "$follow" = "-f" ] || die "Second argument must be -f"
+    setup_state
+    [ -f "$SERVER_LOG" ] || : > "$SERVER_LOG"
+    [ -f "$TUNNEL_LOG" ] || : > "$TUNNEL_LOG"
+    case "$target:$follow" in
+      all:) tail -n 100 "$SERVER_LOG" "$TUNNEL_LOG" ;;
+      all:-f) tail -n 100 -f "$SERVER_LOG" "$TUNNEL_LOG" ;;
+      server:) tail -n 100 "$SERVER_LOG" ;;
+      server:-f) tail -n 100 -f "$SERVER_LOG" ;;
+      tunnel:) tail -n 100 "$TUNNEL_LOG" ;;
+      tunnel:-f) tail -n 100 -f "$TUNNEL_LOG" ;;
+      *) die "Log target must be all, server, or tunnel" ;;
+    esac
+    ;;
+  stop)
+    [ $# -eq 0 ] || die "Usage: nookwire-ssh stop"
+    setup_state
+    stop_one "$TUNNEL_PID_FILE"
+    stop_one "$SERVER_PID_FILE"
+    printf 'Nookwire SSH stopped.\n'
     ;;
   help|-h|--help)
     usage

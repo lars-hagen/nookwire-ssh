@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -183,61 +184,95 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mode 0700"):
                 ensure_host_key(parent / "host-key")
 
-    def test_bootstrap_and_tunnel_output(self):
-        bootstrap = subprocess.run(
-            [str(LAUNCHER), "bootstrap", "/tmp/a path", "8022"],
-            check=True, capture_output=True, text=True,
-        ).stdout
-        tunnel = subprocess.run(
-            [str(LAUNCHER), "tunnel", "8022", "1"],
-            check=True, capture_output=True, text=True,
-        ).stdout
-        self.assertIn("asyncssh==2.24.0", bootstrap)
-        self.assertIn("--root '/tmp/a path'", bootstrap)
-        self.assertIn("ssh-keygen", tunnel)
-        self.assertIn("srv.us -R 1:127.0.0.1:8022", tunnel)
-        self.assertIn("StrictHostKeyChecking=no", tunnel)
-        self.assertIn("ProxyCommand=openssl s_client", tunnel)
-        self.assertIn("-verify_return_error -verify_hostname %h", tunnel)
-        self.assertIn("nookwire@HOSTNAME.srv.us", tunnel)
-        self.assertIn("scp -O", tunnel)
-        subprocess.run(["sh", "-n"], input=bootstrap, text=True, check=True)
-        subprocess.run(["sh", "-n"], input=tunnel, text=True, check=True)
-
-    def test_bootstrap_executes_with_quoted_root_and_password(self):
+    def test_background_start_status_logs_and_stop(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
             root = temp_path / "root with spaces"
             root.mkdir()
             bin_dir = temp_path / "bin"
             bin_dir.mkdir()
-            args_path = temp_path / "uv-args"
-            password_path = temp_path / "password"
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+
             fake_uv = bin_dir / "uv"
             fake_uv.write_text(
                 "#!/bin/sh\n"
-                f"printf '%s\\n' \"$@\" > '{args_path}'\n"
-                f"printf '%s' \"$NOOKWIRE_SSH_PASSWORD\" > '{password_path}'\n",
+                "exec python3 -c 'import socket,time; "
+                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
+                "s.listen(); time.sleep(60)'\n",
                 encoding="utf-8",
             )
             fake_uv.chmod(0o755)
-            bootstrap = subprocess.run(
-                [str(LAUNCHER), "bootstrap", str(root), "8022"],
-                check=True, capture_output=True, text=True,
-            ).stdout
-            environment = os.environ.copy()
-            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
-            environment["TMPDIR"] = str(temp_path)
-            subprocess.run(
-                ["sh"], input=bootstrap, text=True, check=True, env=environment,
-                capture_output=True,
+            fake_keygen = bin_dir / "ssh-keygen"
+            fake_keygen.write_text(
+                "#!/bin/sh\nfor arg do key=$arg; done\nprintf key > \"$key\"\n",
+                encoding="utf-8",
             )
-            args = args_path.read_text(encoding="utf-8")
-            password = password_path.read_text(encoding="utf-8")
-            self.assertIn(str(root), args)
-            self.assertIn("8022", args)
-            self.assertGreaterEqual(len(password), 32)
-            self.assertFalse(any(temp_path.glob("nookwire-ssh.*")))
+            fake_keygen.chmod(0o755)
+            fake_ssh = bin_dir / "ssh"
+            fake_ssh.write_text(
+                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
+                "exec python3 -c 'import time; time.sleep(60)'\n",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "HOME": str(temp_path / "home"),
+                "NOOKWIRE_SSH_STATE_DIR": str(temp_path / "state with spaces"),
+            }
+            Path(environment["HOME"]).mkdir()
+            try:
+                started = subprocess.run(
+                    [str(LAUNCHER), "start", str(root), str(port), "1"],
+                    check=True, capture_output=True, text=True, env=environment,
+                ).stdout
+                self.assertIn("started in the background", started)
+                status = subprocess.run(
+                    [str(LAUNCHER), "status"], check=True, capture_output=True,
+                    text=True, env=environment,
+                ).stdout
+                self.assertIn("server: running", status)
+                self.assertIn("tunnel: running", status)
+                self.assertIn("url: https://example.srv.us/", status)
+                self.assertGreaterEqual(
+                    len((temp_path / "state with spaces" / "password").read_text()), 32
+                )
+                logs = subprocess.run(
+                    [str(LAUNCHER), "logs", "tunnel"], check=True,
+                    capture_output=True, text=True, env=environment,
+                ).stdout
+                self.assertIn("https://example.srv.us/", logs)
+            finally:
+                subprocess.run(
+                    [str(LAUNCHER), "stop"], capture_output=True, text=True,
+                    env=environment,
+                )
+            stopped = subprocess.run(
+                [str(LAUNCHER), "status"], capture_output=True, text=True,
+                env=environment,
+            )
+            self.assertNotEqual(stopped.returncode, 0)
+            self.assertIn("server: stopped", stopped.stdout)
+            self.assertIn("tunnel: stopped", stopped.stdout)
+
+            unrelated = subprocess.Popen(["sleep", "60"])
+            try:
+                state = temp_path / "state with spaces"
+                (state / "server.pid").write_text(
+                    f"{unrelated.pid} deliberately-wrong-identity\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(
+                    [str(LAUNCHER), "stop"], check=True, capture_output=True,
+                    text=True, env=environment,
+                )
+                self.assertIsNone(unrelated.poll())
+            finally:
+                unrelated.terminate()
+                unrelated.wait()
 
     def test_curl_installer_layout(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -6,7 +6,7 @@ The server binds to localhost, authenticates one disposable user with a generate
 
 ## Prerequisites
 
-The local machine which generates and uses commands needs Python 3, gzip, base64, OpenSSH clients, and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support. The remote machine needs Python 3, uv, OpenSSH, and `ssh-keygen`.
+The remote machine needs Python 3, uv, OpenSSH, and `ssh-keygen`. A connecting machine needs OpenSSH and OpenSSL with `s_client -verify_return_error` and `-verify_hostname` support.
 
 ## Install
 
@@ -14,35 +14,37 @@ The local machine which generates and uses commands needs Python 3, gzip, base64
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-The installer places `nookwire-ssh` and its Python server companion in `~/.local/bin`. Add that directory to `PATH` if needed. It installs the version-pinned `v1.0.1` files and restores the previous pair if replacement fails.
+Run the installer on the remote machine you want to expose. It places `nookwire-ssh` and its Python server companion in `~/.local/bin`. Add that directory to `PATH` if needed. It installs the version-pinned `v1.0.2` files and restores the previous pair if replacement fails.
 
-## Remote setup
+## Start
 
-Generate a paste-ready server command locally:
-
-```sh
-nookwire-ssh bootstrap /marimo 8022
-```
-
-Paste the output into remote terminal 1. It prints the username and generated password, installs AsyncSSH into uv's temporary environment, and starts the server on `127.0.0.1:8022`.
-
-Generate the srv.us tunnel block:
+Start AsyncSSH and the srv.us tunnel together in the background:
 
 ```sh
-nookwire-ssh tunnel 8022 1
+nookwire-ssh start /marimo 8022 1
 ```
 
-Paste it into remote terminal 2. Before starting srv.us, it prints ready-to-copy SSH, SFTP, and SCP templates. It then creates `~/.ssh/id_ed25519` when needed, suppresses srv.us host-key prompts, and forwards slot `1` to AsyncSSH. Reusing the same SSH key and slot gives srv.us a stable hostname.
+The command prints the generated password and srv.us URL when available. It returns to the shell while both services keep running.
 
-srv.us prints a URL resembling:
+Inspect them later:
 
-```text
-https://example.srv.us/
+```sh
+nookwire-ssh status
+nookwire-ssh logs
+nookwire-ssh logs tunnel -f
 ```
+
+Stop everything:
+
+```sh
+nookwire-ssh stop
+```
+
+The first start creates `~/.ssh/id_ed25519`. Reusing that key and tunnel slot gives srv.us a stable hostname. Runtime state, credentials, PID files, and logs are stored under `~/.local/state/nookwire-ssh` by default.
 
 ## Connect through TLS
 
-srv.us wraps non-HTTP traffic in TLS. The tunnel block prints these templates before starting srv.us. Replace `HOSTNAME.srv.us` with the hostname in the URL srv.us prints:
+srv.us wraps non-HTTP traffic in TLS. Replace `HOSTNAME.srv.us` with the hostname shown by `nookwire-ssh status`:
 
 ```sh
 ssh -T -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \
@@ -91,7 +93,7 @@ Options:
 - SFTP and SCP are mapped into the configured root. Paths resolving through a symlink to somewhere outside that root are rejected, and creating symlinks over SFTP is disabled.
 - Command sessions start in the root but are not OS-chrooted. Authenticated users can access anything allowed to the server's operating-system account.
 - The server generates and reuses an Ed25519 host key in a private per-user temporary directory. The directory must be owned by the server user with mode `0700`; existing keys must have the same owner and mode `0600`.
-- The generated connection examples disable host-key persistence because this targets short-lived disposable environments.
+- The connection examples disable host-key persistence because this targets short-lived disposable environments.
 
 ## Development
 
@@ -102,4 +104,4 @@ sh -n nookwire-ssh
 sh -n install.sh
 ```
 
-Tests cover authentication, command execution, password removal, confined SFTP, AsyncSSH SCP, process cleanup, system OpenSSH and SCP interoperability, generated shell syntax, and the curl installer layout.
+Tests cover authentication, command execution, password removal, confined SFTP, AsyncSSH SCP, process cleanup, background lifecycle and logs, system OpenSSH and SCP interoperability, and the curl installer layout.
