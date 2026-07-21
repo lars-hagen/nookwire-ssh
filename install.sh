@@ -49,6 +49,19 @@ if ! command -v uv >/dev/null 2>&1; then
   }
 fi
 
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'nookwire-ssh: python3 not found; installing a managed Python via uv\n'
+  uv python install --default
+  for py_bin in "${XDG_BIN_HOME:-}" "$HOME/.local/bin"; do
+    [ -n "$py_bin" ] && [ -x "$py_bin/python3" ] || continue
+    case ":$PATH:" in *":$py_bin:"*) ;; *) PATH="$py_bin:$PATH" ;; esac
+  done
+  command -v python3 >/dev/null 2>&1 || {
+    printf 'nookwire-ssh: python3 install failed; install it manually and re-run\n' >&2
+    exit 1
+  }
+fi
+
 curl -fsSL "$BASE_URL/nookwire-ssh" -o "$TEMP_DIR/nookwire-ssh"
 curl -fsSL "$BASE_URL/nookwire_ssh.py" -o "$TEMP_DIR/nookwire_ssh.py"
 
@@ -81,8 +94,8 @@ case ":$PATH:" in
   *) printf 'Add %s to PATH: export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
 esac
 
-# Any remaining arguments are handed to nookwire-ssh, so a single command can
-# install and then run, e.g. `curl -fsSL .../install.sh | sh -s -- start . 8022 1`.
+# Any remaining arguments are handed to nookwire-ssh, so a single piped command
+# can install and then run (curl ... | sh -s -- start . 8022 1).
 if [ "$#" -gt 0 ]; then
   rm -rf "$TEMP_DIR"
   trap - 0 HUP INT TERM
