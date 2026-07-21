@@ -47,10 +47,22 @@ setup_state() {
 prompt_authorized_key() {
   keys=$HOME/.ssh/authorized_keys
   [ -s "$keys" ] && return 0
-  [ -t 0 ] || return 0
+  # Find an interactive input source. With `curl ... | sh` the shell's stdin is
+  # the piped script, so fall back to the controlling terminal at /dev/tty.
+  if [ -t 0 ]; then
+    tty_in=
+  elif { true < /dev/tty; } 2>/dev/null; then
+    tty_in=/dev/tty
+  else
+    return 0
+  fi
   printf 'No keys in ~/.ssh/authorized_keys.\n' >&2
   printf 'Paste an SSH public key to enable key auth, or press Enter to skip: ' >&2
-  IFS= read -r pasted || return 0
+  if [ -n "$tty_in" ]; then
+    IFS= read -r pasted < "$tty_in" || return 0
+  else
+    IFS= read -r pasted || return 0
+  fi
   case "$pasted" in
     '') printf 'Skipped; password auth only.\n' >&2; return 0 ;;
   esac

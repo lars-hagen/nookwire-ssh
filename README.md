@@ -14,7 +14,7 @@ The remote machine needs Python 3, uv, OpenSSH, and `ssh-keygen`. A connecting m
 curl -fsSL https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/main/install.sh | sh
 ```
 
-Run it on the remote machine you want to expose. It installs the version-pinned `v1.2.0` files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
+Run it on the remote machine you want to expose. It installs the version-pinned `v1.2.1` files (`nookwire-ssh` and its Python server companion) into `~/.local/bin`, restoring the previous pair if replacement fails; add that directory to `PATH` if needed. If `uv` is missing, the installer fetches it from `https://astral.sh/uv` first; if `python3` is missing, it provisions a managed Python through uv.
 
 Any arguments after `--` are passed to `nookwire-ssh`, so a single command can install and start in one go. Exposing the current directory:
 
