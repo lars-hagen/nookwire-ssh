@@ -1,8 +1,10 @@
 import asyncio
+import getpass
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +31,7 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
             username="nookwire",
             password=self.password,
             password_env="NOOKWIRE_SSH_PASSWORD",
+            authorized_keys=Path(self.temporary.name) / "authorized_keys",
             host_key=Path(self.temporary.name) / "host_key",
             shell="/bin/sh",
         )
@@ -56,6 +59,60 @@ class NookwireSSHTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(asyncssh.PermissionDenied):
             await self.connect("incorrect-password-long")
+
+    async def test_authorized_keys_authentication(self):
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        self.config.authorized_keys.write_bytes(key.export_public_key())
+        async with await asyncssh.connect(
+            "127.0.0.1",
+            port=self.port,
+            username="nookwire",
+            client_keys=[key],
+            known_hosts=None,
+        ) as connection:
+            result = await connection.run("printf public-key", check=True)
+        self.assertEqual(result.stdout, "public-key")
+
+        async with await self.connect() as connection:
+            result = await connection.run("printf password-fallback", check=True)
+        self.assertEqual(result.stdout, "password-fallback")
+
+        with self.assertRaises(asyncssh.PermissionDenied):
+            await asyncssh.connect(
+                "127.0.0.1",
+                port=self.port,
+                username="wrong-user",
+                client_keys=[key],
+                known_hosts=None,
+            )
+
+    async def test_pty_allocates_terminal(self):
+        async with await self.connect() as connection:
+            result = await connection.run(
+                'tty; printf "SHELL=%s\\n" "$0"; [ -t 0 ] && echo STDIN_TTY; '
+                "[ -t 1 ] && echo STDOUT_TTY",
+                term_type="xterm-256color",
+                term_size=(80, 24),
+                check=True,
+            )
+        self.assertIn("STDIN_TTY", result.stdout)
+        self.assertIn("STDOUT_TTY", result.stdout)
+        self.assertTrue(
+            "/dev/pts/" in result.stdout or "/dev/tty" in result.stdout,
+            result.stdout,
+        )
+
+    async def test_pty_forwards_large_input(self):
+        payload = "nookwire-pty-line\n" * 6000  # ~108 KB across many lines
+        async with await self.connect() as connection:
+            result = await connection.run(
+                "head -c 100000 | wc -c",
+                term_type="xterm-256color",
+                term_size=(80, 24),
+                input=payload,
+                check=True,
+            )
+        self.assertIn("100000", result.stdout)
 
     async def test_sftp_is_root_mapped(self):
         (self.root / "source.txt").write_text("hello", encoding="utf-8")
@@ -181,8 +238,17 @@ class LauncherTests(unittest.TestCase):
             parent = Path(temp) / "shared"
             parent.mkdir(mode=0o755)
             parent.chmod(0o755)
-            with self.assertRaisesRegex(ValueError, "mode 0700"):
+            with self.assertRaisesRegex(ValueError, "group- or world-accessible"):
                 ensure_host_key(parent / "host-key")
+
+    def test_host_key_parent_allows_setgid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "setgid"
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o2700)
+            key = parent / "host-key"
+            ensure_host_key(key)
+            self.assertTrue(key.is_file())
 
     def test_background_start_status_logs_and_stop(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -205,18 +271,8 @@ class LauncherTests(unittest.TestCase):
             )
             fake_uv.chmod(0o755)
             fake_keygen = bin_dir / "ssh-keygen"
-            fake_keygen.write_text(
-                "#!/bin/sh\nfor arg do key=$arg; done\nprintf key > \"$key\"\n",
-                encoding="utf-8",
-            )
+            fake_keygen.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
             fake_keygen.chmod(0o755)
-            fake_ssh = bin_dir / "ssh"
-            fake_ssh.write_text(
-                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
-                "exec python3 -c 'import time; time.sleep(60)'\n",
-                encoding="utf-8",
-            )
-            fake_ssh.chmod(0o755)
             environment = {
                 **os.environ,
                 "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -224,6 +280,91 @@ class LauncherTests(unittest.TestCase):
                 "NOOKWIRE_SSH_STATE_DIR": str(temp_path / "state with spaces"),
             }
             Path(environment["HOME"]).mkdir()
+
+            fake_python = bin_dir / "python3"
+            fake_python.write_text(
+                "#!/bin/sh\ncase \"$2\" in *hashlib*) sleep 0.2 ;; esac\n"
+                f'exec "{sys.executable}" "$@"\n',
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            fake_uv.write_text(
+                "#!/bin/sh\n"
+                "mkdir \"$NOOKWIRE_SSH_STATE_DIR/server.pid\"\n"
+                f"printf '%s' \"$$\" > '{temp_path / 'server-child'}'\n"
+                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
+                encoding="utf-8",
+            )
+            server_pid_failure = subprocess.run(
+                [str(LAUNCHER), "start", str(root), str(port), "1"],
+                capture_output=True, text=True, env=environment,
+            )
+            self.assertNotEqual(server_pid_failure.returncode, 0)
+            self.assertIn("Unable to track server process", server_pid_failure.stderr)
+            server_pid = int((temp_path / "server-child").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(server_pid, 0)
+            failed_status = subprocess.run(
+                [str(LAUNCHER), "status"], capture_output=True, text=True,
+                env=environment,
+            )
+            self.assertIn("server: stopped", failed_status.stdout)
+            (temp_path / "state with spaces" / "server.pid").rmdir()
+
+            fake_uv.write_text(
+                "#!/bin/sh\n"
+                f'exec "{sys.executable}" -c \'import socket,time; '
+                f"s=socket.socket(); s.bind((\"127.0.0.1\", {port})); "
+                "s.listen(); time.sleep(60)'\n",
+                encoding="utf-8",
+            )
+            failed = subprocess.run(
+                [str(LAUNCHER), "start", str(root), str(port), "1"],
+                capture_output=True, text=True, env=environment,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            failed_status = subprocess.run(
+                [str(LAUNCHER), "status"], capture_output=True, text=True,
+                env=environment,
+            )
+            self.assertIn("server: stopped", failed_status.stdout)
+
+            fake_ssh = bin_dir / "ssh"
+            fake_ssh.write_text(
+                "#!/bin/sh\nmkdir \"$NOOKWIRE_SSH_STATE_DIR/tunnel.pid\"\n"
+                f"printf '%s' \"$$\" > '{temp_path / 'tunnel-child'}'\n"
+                "printf 'https://example.srv.us/\\n'\n"
+                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o755)
+
+            fake_keygen.write_text(
+                "#!/bin/sh\nfor arg do key=$arg; done\nprintf key > \"$key\"\n",
+                encoding="utf-8",
+            )
+            tunnel_pid_failure = subprocess.run(
+                [str(LAUNCHER), "start", str(root), str(port), "1"],
+                capture_output=True, text=True, env=environment,
+            )
+            self.assertNotEqual(tunnel_pid_failure.returncode, 0)
+            self.assertIn("Unable to track tunnel process", tunnel_pid_failure.stderr)
+            failed_status = subprocess.run(
+                [str(LAUNCHER), "status"], capture_output=True, text=True,
+                env=environment,
+            )
+            self.assertIn("server: stopped", failed_status.stdout)
+            self.assertIn("tunnel: stopped", failed_status.stdout)
+            tunnel_pid = int((temp_path / "tunnel-child").read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(tunnel_pid, 0)
+            (temp_path / "state with spaces" / "tunnel.pid").rmdir()
+
+            fake_ssh.write_text(
+                "#!/bin/sh\nprintf 'https://example.srv.us/\\n'\n"
+                f'exec "{sys.executable}" -c "import time; time.sleep(60)"\n',
+                encoding="utf-8",
+            )
             try:
                 started = subprocess.run(
                     [str(LAUNCHER), "start", str(root), str(port), "1"],
@@ -238,7 +379,8 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn("tunnel: running", status)
                 self.assertIn("url: https://example.srv.us/", status)
                 self.assertIn("ProxyCommand=openssl s_client", status)
-                self.assertIn("nookwire@example.srv.us", status)
+                self.assertIn(f"{getpass.getuser()}@example.srv.us", status)
+                self.assertIn("key auth: disabled", status)
                 self.assertNotIn("logs:", started)
                 self.assertGreaterEqual(
                     len((temp_path / "state with spaces" / "password").read_text()), 32

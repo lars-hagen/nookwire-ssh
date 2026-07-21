@@ -13,12 +13,15 @@ usage() {
   cat <<'EOF'
 Usage: nookwire-ssh COMMAND [ARGS]
 
-  start [REMOTE_ROOT] [PORT] [SLOT]
+  start [DIR] [--port PORT] [--slot SLOT]
   status
   logs [all|server|tunnel] [-f]
   stop
 
-start launches AsyncSSH and srv.us in the background.
+start launches AsyncSSH and srv.us in the background, exposing DIR
+(default: current directory) on PORT (default 8022) through srv.us slot
+SLOT (default 1). PORT and SLOT may also be given positionally, so
+"start", "start .", and "start /path 8022 1" all work.
 status prints processes, credentials, and the srv.us URL when available.
 logs shows the last 100 log lines; add -f to follow.
 stop terminates both background processes.
@@ -39,6 +42,35 @@ setup_state() {
   umask 077
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+}
+
+prompt_authorized_key() {
+  keys=$HOME/.ssh/authorized_keys
+  [ -s "$keys" ] && return 0
+  [ -t 0 ] || return 0
+  printf 'No keys in ~/.ssh/authorized_keys.\n' >&2
+  printf 'Paste an SSH public key to enable key auth, or press Enter to skip: ' >&2
+  IFS= read -r pasted || return 0
+  case "$pasted" in
+    '') printf 'Skipped; password auth only.\n' >&2; return 0 ;;
+  esac
+  if ! mkdir -p "$HOME/.ssh" || ! chmod 700 "$HOME/.ssh"; then
+    printf 'Unable to prepare %s; skipped.\n' "$HOME/.ssh" >&2
+    return 0
+  fi
+  tmp=$(mktemp "$HOME/.ssh/nookwire-key.XXXXXX") || {
+    printf 'Unable to create a temporary file; skipped.\n' >&2
+    return 0
+  }
+  printf '%s\n' "$pasted" > "$tmp"
+  if ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
+    printf '%s\n' "$pasted" >> "$keys"
+    chmod 600 "$keys"
+    printf 'Key added to %s.\n' "$keys" >&2
+  else
+    printf 'Not a valid SSH public key; skipped.\n' >&2
+  fi
+  rm -f "$tmp"
 }
 
 read_pid() {
@@ -88,6 +120,18 @@ stop_one() {
   rm -f "$file"
 }
 
+stop_untracked_pid() {
+  pid=$1
+  kill "$pid" 2>/dev/null || true
+  count=0
+  while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 50 ]; do
+    sleep 0.1
+    count=$((count + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; fi
+  wait "$pid" 2>/dev/null || true
+}
+
 extract_host() {
   [ -f "$TUNNEL_LOG" ] || return 1
   python3 -c 'import pathlib,re,sys; m=re.findall(r"https://([A-Za-z0-9.-]+\.srv\.us)/?", pathlib.Path(sys.argv[1]).read_text(errors="replace")); print(m[-1] if m else "")' "$TUNNEL_LOG"
@@ -108,17 +152,23 @@ show_status() {
     printf 'tunnel: stopped\n'
     tunnel_ok=0
   fi
-  [ ! -f "$PASSWORD_FILE" ] || printf 'username: nookwire\npassword: %s\n' "$(cat "$PASSWORD_FILE")"
+  ssh_user=$(id -un 2>/dev/null || echo nookwire)
+  [ ! -f "$PASSWORD_FILE" ] || printf 'username: %s\npassword: %s\n' "$ssh_user" "$(cat "$PASSWORD_FILE")"
+  if [ -s "$HOME/.ssh/authorized_keys" ]; then
+    printf 'key auth: enabled\n'
+  else
+    printf 'key auth: disabled; add keys to ~/.ssh/authorized_keys\n'
+  fi
   host=$(extract_host 2>/dev/null || true)
   if [ -n "$host" ]; then
     printf 'url: https://%s/\n' "$host"
     cat <<EOF
 ssh:
-ssh -T \\
+ssh \\
   -o 'ProxyCommand=openssl s_client -quiet -verify_return_error -verify_hostname %h -connect %h:443 -servername %h 2>/dev/null' \\
   -o StrictHostKeyChecking=no \\
   -o UserKnownHostsFile=/dev/null \\
-  nookwire@$host
+  $ssh_user@$host
 EOF
   else
     printf 'url: pending; run nookwire-ssh logs tunnel -f\n'
@@ -131,11 +181,33 @@ command=${1:-help}
 
 case "$command" in
   start)
-    [ $# -le 3 ] || die "Usage: nookwire-ssh start [REMOTE_ROOT] [PORT] [SLOT]"
-    root=${1:-/marimo}
-    port=$(validate_port "${2:-8022}") || die "PORT must contain only ASCII digits and be from 1 to 65535"
-    slot=$(validate_slot "${3:-1}") || die "SLOT must be a positive integer"
-    [ -d "$root" ] || die "REMOTE_ROOT is not a directory: $root"
+    root_arg=.
+    port_arg=8022
+    slot_arg=1
+    posn=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p|--port) shift; [ $# -ge 1 ] || die "--port needs a value"; port_arg=$1 ;;
+        --port=*) port_arg=${1#*=} ;;
+        -s|--slot) shift; [ $# -ge 1 ] || die "--slot needs a value"; slot_arg=$1 ;;
+        --slot=*) slot_arg=${1#*=} ;;
+        -h|--help) usage; exit 0 ;;
+        -*) die "Unknown option: $1 (see nookwire-ssh help)" ;;
+        *)
+          posn=$((posn + 1))
+          case "$posn" in
+            1) root_arg=$1 ;;
+            2) port_arg=$1 ;;
+            3) slot_arg=$1 ;;
+            *) die "Too many arguments: $1" ;;
+          esac
+          ;;
+      esac
+      shift
+    done
+    port=$(validate_port "$port_arg") || die "PORT must contain only ASCII digits and be from 1 to 65535"
+    slot=$(validate_slot "$slot_arg") || die "SLOT must be a positive integer"
+    root=$(CDPATH= cd "$root_arg" 2>/dev/null && pwd) || die "REMOTE_ROOT is not a directory: $root_arg"
     command -v uv >/dev/null 2>&1 || die "uv is required"
     command -v ssh >/dev/null 2>&1 || die "ssh is required"
     command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
@@ -147,15 +219,20 @@ case "$command" in
     ! is_running "$TUNNEL_PID_FILE" || die "Tunnel is already running"
     rm -f "$SERVER_PID_FILE" "$TUNNEL_PID_FILE"
     ! port_open "$port" || die "Port $port is already in use"
+    prompt_authorized_key
     password=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')
     printf '%s' "$password" > "$PASSWORD_FILE"
     : > "$SERVER_LOG"
     : > "$TUNNEL_LOG"
     NOOKWIRE_SSH_PASSWORD=$password nohup uv run --with "asyncssh==$ASYNCSSH_VERSION" \
       python "$server_script" --root "$root" --host 127.0.0.1 --port "$port" \
+      --username "$(id -un)" \
       >"$SERVER_LOG" 2>&1 </dev/null &
     server_pid=$!
-    write_pid "$server_pid" "$SERVER_PID_FILE" || die "Unable to track server process"
+    write_pid "$server_pid" "$SERVER_PID_FILE" || {
+      stop_untracked_pid "$server_pid"
+      die "Unable to track server process"
+    }
     ready=0
     count=0
     while [ "$count" -lt 120 ]; do
@@ -173,10 +250,15 @@ case "$command" in
       tail -n 100 "$SERVER_LOG" >&2 || true
       exit 1
     fi
-    mkdir -p "$HOME/.ssh"
-    chmod 700 "$HOME/.ssh"
+    if ! mkdir -p "$HOME/.ssh" || ! chmod 700 "$HOME/.ssh"; then
+      stop_one "$SERVER_PID_FILE"
+      die "Unable to prepare $HOME/.ssh"
+    fi
     if [ ! -s "$HOME/.ssh/id_ed25519" ]; then
-      ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+      if ! ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"; then
+        stop_one "$SERVER_PID_FILE"
+        die "Unable to create the srv.us tunnel key"
+      fi
     fi
     nohup ssh \
       -i "$HOME/.ssh/id_ed25519" \
@@ -191,6 +273,7 @@ case "$command" in
       >"$TUNNEL_LOG" 2>&1 </dev/null &
     tunnel_pid=$!
     write_pid "$tunnel_pid" "$TUNNEL_PID_FILE" || {
+      stop_untracked_pid "$tunnel_pid"
       stop_one "$SERVER_PID_FILE"
       die "Unable to track tunnel process"
     }

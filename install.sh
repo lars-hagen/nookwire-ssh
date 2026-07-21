@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=${NOOKWIRE_SSH_VERSION:-1.0.3}
+VERSION=${NOOKWIRE_SSH_VERSION:-1.2.0}
 BASE_URL=${NOOKWIRE_SSH_BASE_URL:-https://raw.githubusercontent.com/lars-hagen/nookwire-ssh/v$VERSION}
 PREFIX=${NOOKWIRE_SSH_PREFIX:-"$HOME/.local"}
 BIN_DIR="$PREFIX/bin"
@@ -36,6 +36,19 @@ command -v curl >/dev/null 2>&1 || {
   exit 1
 }
 
+if ! command -v uv >/dev/null 2>&1; then
+  printf 'nookwire-ssh: uv not found; installing from https://astral.sh/uv\n'
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  for uv_bin in "${XDG_BIN_HOME:-}" "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+    [ -n "$uv_bin" ] && [ -x "$uv_bin/uv" ] || continue
+    case ":$PATH:" in *":$uv_bin:"*) ;; *) PATH="$uv_bin:$PATH" ;; esac
+  done
+  command -v uv >/dev/null 2>&1 || {
+    printf 'nookwire-ssh: uv install failed; install it manually and re-run\n' >&2
+    exit 1
+  }
+fi
+
 curl -fsSL "$BASE_URL/nookwire-ssh" -o "$TEMP_DIR/nookwire-ssh"
 curl -fsSL "$BASE_URL/nookwire_ssh.py" -o "$TEMP_DIR/nookwire_ssh.py"
 
@@ -67,3 +80,11 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) printf 'Add %s to PATH: export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
 esac
+
+# Any remaining arguments are handed to nookwire-ssh, so a single command can
+# install and then run, e.g. `curl -fsSL .../install.sh | sh -s -- start . 8022 1`.
+if [ "$#" -gt 0 ]; then
+  rm -rf "$TEMP_DIR"
+  trap - 0 HUP INT TERM
+  exec "$BIN_DIR/nookwire-ssh" "$@"
+fi

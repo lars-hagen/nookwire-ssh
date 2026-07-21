@@ -6,19 +6,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
+import getpass
 import hmac
+import pwd
 import os
+import pty
 import signal
 import stat
+import struct
 import sys
 import tempfile
+import termios
 from dataclasses import dataclass
 from pathlib import Path
 
 import asyncssh
 
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 DEFAULT_PASSWORD_ENV = "NOOKWIRE_SSH_PASSWORD"
 DEFAULT_HOST_KEY = (
     Path(tempfile.gettempdir()) / f"nookwire-ssh-{os.geteuid()}" / "host-key"
@@ -33,18 +39,34 @@ class Config:
     username: str
     password: str
     password_env: str
+    authorized_keys: Path
     host_key: Path
     shell: str
 
 
 class TokenSSHServer(asyncssh.SSHServer):
-    """Authenticate one disposable user with a generated password."""
+    """Authenticate one disposable user with authorized keys or a password."""
 
     def __init__(self, config: Config):
         self.config = config
+        self.connection: asyncssh.SSHServerConnection | None = None
 
-    def begin_auth(self, _username: str) -> bool:
+    def connection_made(self, connection: asyncssh.SSHServerConnection) -> None:
+        self.connection = connection
+
+    def begin_auth(self, username: str) -> bool:
+        valid_user = hmac.compare_digest(
+            username.encode("utf-8"), self.config.username.encode("utf-8")
+        )
+        authorized_keys = self.config.authorized_keys
+        if self.connection and valid_user and authorized_keys.is_file():
+            self.connection.set_authorized_keys(str(authorized_keys))
+        elif self.connection:
+            self.connection.set_authorized_keys(None)
         return True
+
+    def public_key_auth_supported(self) -> bool:
+        return self.config.authorized_keys.is_file()
 
     def password_auth_supported(self) -> bool:
         return True
@@ -67,8 +89,12 @@ def ensure_host_key(path: Path) -> None:
             raise ValueError(
                 f"Host key parent must be owned by uid {os.geteuid()}: {parent}"
             )
-        if stat.S_IMODE(info.st_mode) != 0o700:
-            raise ValueError(f"Host key parent must have mode 0700: {parent}")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            # Owner-only access is the security property; tolerate setgid/sticky
+            # bits that some filesystems force onto directories (e.g. grpid mounts).
+            raise ValueError(
+                f"Host key parent must not be group- or world-accessible: {parent}"
+            )
     else:
         parent.mkdir(mode=0o700, parents=True)
 
@@ -139,24 +165,216 @@ async def pump_child_output(
         pass
 
 
+def build_child_argv(command: str, config: Config) -> list[str]:
+    if command:
+        return [config.shell, "-lc", command]
+    # Interactive session: start a login shell so the usual profile scripts run
+    # and construct PS1, PATH, etc., matching a normal OpenSSH login.
+    if os.path.basename(config.shell) in ("bash", "zsh"):
+        return [config.shell, "-l", "-i"]
+    return [config.shell, "-i"]
+
+
+def build_child_environment(
+    process: asyncssh.SSHServerProcess, config: Config
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop(config.password_env, None)
+    account = pwd.getpwuid(os.geteuid())
+    environment["USER"] = account.pw_name
+    environment["LOGNAME"] = account.pw_name
+    environment["SHELL"] = config.shell
+    environment.setdefault("HOME", account.pw_dir)
+    environment["PWD"] = str(config.root)
+    if process.term_type is not None:
+        # A pty was requested; the term type may be empty when the client has no
+        # TERM set, so fall back to a widely supported value. PS1 and the rest of
+        # the prompt are left to the login shell's own startup files.
+        environment["TERM"] = process.term_type or "xterm-256color"
+    return environment
+
+
+def set_terminal_size(fd: int, term_size: tuple[int, int, int, int]) -> None:
+    width, height, pixwidth, pixheight = term_size
+    if width and height:
+        winsize = struct.pack("HHHH", height, width, pixwidth, pixheight)
+        with contextlib.suppress(OSError):
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+
+
+def acquire_controlling_tty() -> None:
+    """Give the child its own session and controlling terminal for job control."""
+    os.setsid()
+    with contextlib.suppress(OSError):
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def forward_signal(child: asyncio.subprocess.Process, name: str) -> None:
+    """Deliver an SSH-requested signal to the child's process group."""
+    signum = getattr(signal, f"SIG{name}", None) or getattr(signal, name, None)
+    if signum is None or child.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, ValueError):
+        os.killpg(child.pid, int(signum))
+
+
+async def pump_ssh_to_pty(
+    process: asyncssh.SSHServerProcess,
+    transport: asyncio.WriteTransport,
+    master_fd: int,
+    child: asyncio.subprocess.Process,
+) -> None:
+    """Forward client input to the pty, applying resize and signal requests."""
+    while True:
+        try:
+            data = await process.stdin.read(64 * 1024)
+        except asyncssh.TerminalSizeChanged as change:
+            set_terminal_size(
+                master_fd,
+                (change.width, change.height, change.pixwidth, change.pixheight),
+            )
+            continue
+        except asyncssh.SignalReceived as received:
+            forward_signal(child, received.signal)
+            continue
+        except (asyncssh.BreakReceived, asyncssh.SoftEOFReceived):
+            continue
+        except (ConnectionError, BrokenPipeError):
+            break
+        if not data:
+            break
+        if isinstance(data, str):
+            data = data.encode("utf-8", "surrogateescape")
+        try:
+            transport.write(data)
+        except (ConnectionError, BrokenPipeError):
+            break
+
+
+async def pump_pty_to_ssh(
+    reader: asyncio.StreamReader, process: asyncssh.SSHServerProcess
+) -> None:
+    """Stream pty output back to the client until the pty reaches EOF."""
+    while True:
+        try:
+            data = await reader.read(64 * 1024)
+        except OSError:
+            break
+        if not data:
+            break
+        try:
+            process.stdout.write(data)
+            await process.stdout.drain()
+        except (ConnectionError, BrokenPipeError):
+            break
+
+
+async def handle_pty_process(
+    process: asyncssh.SSHServerProcess,
+    config: Config,
+    argv: list[str],
+    environment: dict[str, str],
+) -> None:
+    loop = asyncio.get_running_loop()
+    master_fd, slave_fd = pty.openpty()
+    set_terminal_size(slave_fd, process.term_size)
+    read_dup = -1
+    slave_open = True
+    read_transport: asyncio.ReadTransport | None = None
+    write_transport: asyncio.WriteTransport | None = None
+    child: asyncio.subprocess.Process | None = None
+    try:
+        try:
+            child = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=config.root,
+                env=environment,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                preexec_fn=acquire_controlling_tty,
+            )
+        finally:
+            os.close(slave_fd)
+            slave_open = False
+
+        # Output: read the pty master through a dedicated descriptor.
+        read_dup = os.dup(master_fd)
+        reader = asyncio.StreamReader()
+        read_transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader),
+            os.fdopen(read_dup, "rb", 0),
+        )
+        read_dup = -1  # owned by read_transport now
+        # Input: write through a transport so partial writes and EAGAIN on the
+        # (now non-blocking) master descriptor are handled by asyncio.
+        write_transport, _ = await loop.connect_write_pipe(
+            asyncio.Protocol, os.fdopen(master_fd, "wb", 0)
+        )
+
+        input_task = asyncio.create_task(
+            pump_ssh_to_pty(process, write_transport, master_fd, child)
+        )
+        output_task = asyncio.create_task(pump_pty_to_ssh(reader, process))
+        child_wait = asyncio.create_task(child.wait())
+        channel_wait = asyncio.create_task(process.wait_closed())
+        disconnected = False
+        try:
+            done, _ = await asyncio.wait(
+                (child_wait, channel_wait), return_when=asyncio.FIRST_COMPLETED
+            )
+            disconnected = channel_wait in done
+            if disconnected and child.returncode is None:
+                await terminate_process_group(child)
+            returncode = await child_wait
+            if not disconnected:
+                # Drain buffered pty output before reporting the exit status.
+                await output_task
+        finally:
+            input_task.cancel()
+            output_task.cancel()
+            channel_wait.cancel()
+            if child.returncode is None:
+                await terminate_process_group(child)
+            await asyncio.gather(
+                input_task,
+                output_task,
+                channel_wait,
+                child_wait,
+                return_exceptions=True,
+            )
+
+        if not disconnected:
+            process.exit(returncode if returncode >= 0 else 128 - returncode)
+    finally:
+        if slave_open:
+            with contextlib.suppress(OSError):
+                os.close(slave_fd)
+        if read_transport is not None:
+            read_transport.close()
+        elif read_dup >= 0:
+            with contextlib.suppress(OSError):
+                os.close(read_dup)
+        if write_transport is not None:
+            write_transport.close()
+        else:
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+        if child is not None and child.returncode is None:
+            await terminate_process_group(child)
+
+
 async def handle_process(process: asyncssh.SSHServerProcess, config: Config) -> None:
     command = process.command
     if isinstance(command, bytes):
         command = command.decode("utf-8", "surrogateescape")
 
-    argv = [config.shell, "-lc", command] if command else [config.shell, "-i"]
-    environment = os.environ.copy()
-    environment.pop(config.password_env, None)
-    environment.update(
-        {
-            "HOME": str(config.root),
-            "PWD": str(config.root),
-            "USER": config.username,
-            "LOGNAME": config.username,
-        }
-    )
-    if process.term_type:
-        environment["TERM"] = process.term_type
+    argv = build_child_argv(command, config)
+    environment = build_child_environment(process, config)
+
+    if process.term_type is not None:
+        await handle_pty_process(process, config, argv, environment)
+        return
 
     child = await asyncio.create_subprocess_exec(
         *argv,
@@ -284,12 +502,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", default="/marimo", help="SFTP root and command working directory")
     parser.add_argument("--host", default="127.0.0.1", help="listen address")
     parser.add_argument("--port", type=int, default=8022, help="listen port")
-    parser.add_argument("--username", default="nookwire", help="accepted SSH username")
+    parser.add_argument(
+        "--username",
+        default=getpass.getuser(),
+        help="accepted SSH username (default: current OS user)",
+    )
     parser.add_argument("--password-env", default=DEFAULT_PASSWORD_ENV, help="environment variable containing the password")
+    parser.add_argument("--authorized-keys", default="~/.ssh/authorized_keys", help="OpenSSH authorized_keys file")
     parser.add_argument("--host-key", default=str(DEFAULT_HOST_KEY), help="persistent Ed25519 host key path")
-    parser.add_argument("--shell", default="/bin/sh", help="shell used for commands and pipe-backed shell sessions")
+    parser.add_argument("--shell", default=None, help="shell used for commands and interactive sessions (default: $SHELL, then bash, then sh)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser.parse_args(argv)
+
+
+def resolve_shell(requested: str | None) -> str:
+    if requested is not None:
+        candidates = [requested]
+    else:
+        candidates = [os.environ.get("SHELL", ""), "/bin/bash", "/bin/sh"]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            shell = Path(candidate).expanduser().resolve(strict=True)
+        except OSError:
+            continue
+        if shell.is_file() and os.access(shell, os.X_OK):
+            return str(shell)
+    raise ValueError("No usable shell found; set --shell to an executable")
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -305,9 +545,7 @@ def build_config(args: argparse.Namespace) -> Config:
     if len(password) < 16:
         raise ValueError(f"{args.password_env} must contain at least 16 characters")
 
-    shell = Path(args.shell).expanduser().resolve(strict=True)
-    if not shell.is_file() or not os.access(shell, os.X_OK):
-        raise ValueError(f"Shell is not executable: {shell}")
+    shell = resolve_shell(args.shell)
 
     return Config(
         root=root,
@@ -316,6 +554,7 @@ def build_config(args: argparse.Namespace) -> Config:
         username=args.username,
         password=password,
         password_env=args.password_env,
+        authorized_keys=Path(args.authorized_keys).expanduser().resolve(),
         host_key=Path(args.host_key).expanduser().resolve(),
         shell=str(shell),
     )
