@@ -51,15 +51,23 @@ fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   printf 'nookwire-ssh: python3 not found; installing a managed Python via uv\n'
-  uv python install --default
+  if ! uv python install --preview-features python-install-default --default; then
+    printf 'nookwire-ssh: python3 install failed; install it manually and re-run\n' >&2
+    exit 1
+  fi
+  py_shim_dir=
   for py_bin in "${XDG_BIN_HOME:-}" "$HOME/.local/bin"; do
     [ -n "$py_bin" ] && [ -x "$py_bin/python3" ] || continue
     case ":$PATH:" in *":$py_bin:"*) ;; *) PATH="$py_bin:$PATH" ;; esac
+    py_shim_dir="$py_bin"
   done
   command -v python3 >/dev/null 2>&1 || {
     printf 'nookwire-ssh: python3 install failed; install it manually and re-run\n' >&2
     exit 1
   }
+  if [ -n "$py_shim_dir" ]; then
+    printf 'nookwire-ssh: managed Python at %s; keep it on PATH for future sessions\n' "$py_shim_dir"
+  fi
 fi
 
 curl -fsSL "$BASE_URL/nookwire-ssh" -o "$TEMP_DIR/nookwire-ssh"
